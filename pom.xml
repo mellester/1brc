@@ -252,6 +252,7 @@
                   <goal>enforce</goal>
                 </goals>
                 <configuration>
+                  <compilerArgs>--enable-preview</compilerArgs>
                   <rules>
                     <requireJavaVersion>
                       <version>${maven.compiler.release}</version>
