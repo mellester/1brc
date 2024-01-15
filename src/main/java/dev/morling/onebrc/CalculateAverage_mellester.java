@@ -87,7 +87,6 @@ public class CalculateAverage_mellester {
     }
 
     static MeasurementAggregator measurementCombiner(MeasurementAggregator agg1, MeasurementAggregator agg2) {
-        // var res = new MeasurementAggregator();
         agg1.min = Math.min(agg1.min, agg2.min);
         agg1.max = Math.max(agg1.max, agg2.max);
         agg1.sum = agg1.sum + agg2.sum;
@@ -104,17 +103,11 @@ public class CalculateAverage_mellester {
                 throw new UncheckedIOException(e);
             }
         }
-
-        @Override
-        public String toString() {
-            return "Chunk [length=" + length + ", offset=" + offset + ", end=" + (offset + length - OVERLAP_SIZE) + "]";
-        }
     };
 
     private static final List<Chunk> mappings = new ArrayList<>();
 
     public static void main(String[] args) throws IOException {
-
         try {
             long size = raf.length();
             for (long offset = 0; offset < size; offset += MAPPING_SIZE) {
@@ -131,8 +124,7 @@ public class CalculateAverage_mellester {
             }
         }
         catch (IOException e) {
-            raf.close();
-            throw e;
+            throw new UncheckedIOException(e);
         }
         System.err.println("availableProcessors " + Runtime.getRuntime().availableProcessors());
         try (ExecutorService threadExecutors = Executors
@@ -167,17 +159,13 @@ public class CalculateAverage_mellester {
 
             threadExecutors.shutdown();
 
-            // if (System.getProperty("log.enable") == null)
             System.out.println(treeMap);
         }
         catch (InterruptedException e) {
-
             e.printStackTrace();
             System.exit(1);
-
         }
         System.exit(0);
-
     }
 
     private static class Worker implements Callable<Map<String, MeasurementAggregator>> {
@@ -189,12 +177,6 @@ public class CalculateAverage_mellester {
         public Worker(int id, Chunk chunk) {
             this.id = id;
             this.chunk = chunk;
-        }
-
-        void log(Object arg) {
-            if (System.getProperty("log.enable") != null) {
-                System.out.println("[" + id + "]" + arg);
-            }
         }
 
         private int old_index = 0;
@@ -235,7 +217,6 @@ public class CalculateAverage_mellester {
 
             }
             catch (Exception e) {
-                // TODO: handle exception
                 return null;
             }
         }
@@ -293,7 +274,6 @@ public class CalculateAverage_mellester {
 
             public ByteCharSequence(byte[] bytes) {
                 this.bytes = bytes;
-                // assert (bytes.length >= 2);
             }
 
             @Override
