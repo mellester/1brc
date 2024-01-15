@@ -22,62 +22,47 @@ package dev.morling.onebrc;
 
 import static java.util.stream.Collectors.*;
 
-import java.io.FileNotFoundException;
 import java.io.IOException;
 import java.io.RandomAccessFile;
 import java.io.UncheckedIOException;
 import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
-import java.nio.file.Files;
-import java.nio.file.Paths;
+import java.util.AbstractMap.SimpleEntry;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.TreeMap;
 import java.util.stream.Collector;
 import java.util.stream.IntStream;
-import java.util.stream.LongStream;
-
-import javax.swing.JPopupMenu.Separator;
 
 import java.util.concurrent.*;
-import java.util.concurrent.atomic.AtomicInteger;
-
-import jdk.incubator.vector.VectorSpecies;
-import jdk.javadoc.internal.doclets.formats.html.resources.standard;
-import jdk.incubator.vector.*;
 
 public class CalculateAverage_mellester {
 
     private static final String FILE = "./measurements.txt";
     private static RandomAccessFile raf;
+    private static long MAPPING_SIZE;
+    private static final int OVERLAP_SIZE = 2 << 7;
     static {
         try {
             raf = new RandomAccessFile(FILE, "r");
-        } catch (FileNotFoundException e) {
-            System.err.println("File not found: " + FILE);
+            MAPPING_SIZE = raf.length() / Runtime.getRuntime().availableProcessors();
+            MAPPING_SIZE = Math.min(MAPPING_SIZE, Integer.MAX_VALUE - OVERLAP_SIZE * 2);
+            MAPPING_SIZE = Math.max(MAPPING_SIZE, OVERLAP_SIZE * 2);
+        }
+        catch (IOException e) {
+            e.printStackTrace();
             System.exit(1);
         }
     }
 
-    private static record ResultRow(double min, double mean, double max) {
-
-        public String toString() {
-            return round(min) + "/" + round(mean) + "/" + round(max);
-        }
-
-        private double round(double value) {
-            return Math.round(value * 10.0) / 10.0;
-        }
-    };
-
     private static record Measurement(Worker.ByteCharSequence station, double value) {
 
-        private Measurement(Worker.ByteCharSequence[] parts) {
-            this(parts[0], CalculateAverage_mellester.parseDouble(parts[1]));
+        private Measurement(SimpleEntry<Worker.ByteCharSequence, Double> pair) {
+            this(pair.getKey(), pair.getValue());
         }
-
     }
 
     private static class MeasurementAggregator {
@@ -85,9 +70,15 @@ public class CalculateAverage_mellester {
         private double max = Double.NEGATIVE_INFINITY;
         private double sum;
         private long count;
+
+        @Override
+        public String toString() {
+            return String.format("%.1f/%.1f/%.1f", this.min, this.sum / this.count, this.max);
+        }
     }
 
     static void measurementAccumulator(MeasurementAggregator a, Measurement m) {
+
         a.min = Math.min(a.min, m.value);
         a.max = Math.max(a.max, m.value);
         a.sum += m.value;
@@ -104,24 +95,11 @@ public class CalculateAverage_mellester {
         return agg1;
     }
 
-    private static final int MAPPING_SIZE = 1 << 9;
-    private static final long OVERLAP_SIZE = 2 << 7;
-    static {
-        try {
-            System.out.println("RAF_lenght: " + raf.length());
-        } catch (Exception e) {
-            // TODO: handle exception
-            System.err.println("Error getting RAF lenght");
-        }
-        System.out.println("MAPPING_SIZE: " + MAPPING_SIZE);
-        System.out.println("OVERLAP_SIZE: " + OVERLAP_SIZE);
-
-    }
-
     private static record Chunk(long offset, long length) {
         public ByteBuffer buffer() {
             try {
-                return raf.getChannel().map(FileChannel.MapMode.READ_ONLY, this.offset, this.length);
+                long length = Math.min(raf.length() - offset, this.length);
+                return raf.getChannel().map(FileChannel.MapMode.READ_ONLY, this.offset, length);
             } catch (IOException e) {
                 throw new UncheckedIOException(e);
             }
@@ -137,64 +115,62 @@ public class CalculateAverage_mellester {
 
     public static void main(String[] args) throws IOException {
 
-        final VectorSpecies<Byte> SPECIES = VectorSpecies.ofPreferred(byte.class);
-        int length = SPECIES.length();
-        System.out.println("SPECIES: " + SPECIES);
-        System.out.println("length: " + length);
         try {
             long size = raf.length();
             for (long offset = 0; offset < size; offset += MAPPING_SIZE) {
-                int lenght = (int) Math.min(size - offset, MAPPING_SIZE + OVERLAP_SIZE);
+                long lenght;
+                if (offset + MAPPING_SIZE > size) {
+                    lenght = (int) (size - offset);
+                }
+                else {
+                    lenght = MAPPING_SIZE + OVERLAP_SIZE;
+                }
+                lenght = Math.min(lenght, size - offset);
+
                 mappings.add(new Chunk(offset, lenght));
             }
-            System.out.println("mappings: " + mappings.size());
-        } catch (IOException e) {
+        }
+        catch (IOException e) {
             raf.close();
             throw e;
         }
-
-        try (ExecutorService threadExecutors = Executors.newVirtualThreadPerTaskExecutor()) {
-            int count = 0;
-            var result = new ArrayList<Future<Object>>(mappings.size());
+        System.err.println("availableProcessors " + Runtime.getRuntime().availableProcessors());
+        try (ExecutorService threadExecutors = Executors
+                .newFixedThreadPool(Runtime.getRuntime().availableProcessors())) {
+            CompletionService<Map<String, MeasurementAggregator>> completionService = new ExecutorCompletionService<>(
+                    threadExecutors);
             for (int i = 0; i < mappings.size(); i++) {
                 Chunk record = mappings.get(i);
-                if (count++ == 2) {
-                    System.out.println("count: " + count);
-                    break;
-                }
-                result.add(threadExecutors.submit(new Worker(i, record)));
+                completionService.submit(new Worker(i, record));
             }
-
-         
+            int received = 0;
+            boolean errors = false;
+            var treeMap = new TreeMap<String, MeasurementAggregator>();
+            while (received < mappings.size() && !errors) {
+                Future<Map<String, MeasurementAggregator>> resultFuture = completionService.take();
+                try {
+                    Map<String, MeasurementAggregator> resultChunk = resultFuture.get();
+                    received++;
+                    if (resultChunk != null) {
+                        resultChunk.forEach((k, v) -> {
+                            treeMap.merge(k, v, CalculateAverage_mellester::measurementCombiner);
+                        });
+                    }
+                }
+                catch (Exception e) {
+                    System.err.println("Error getting result out of future");
+                    e.printStackTrace();
+                    errors = true;
+                }
+                resultFuture = null;
+            }
 
             threadExecutors.shutdown();
-            boolean TerminatedWithinTime = threadExecutors.awaitTermination(2, TimeUnit.MINUTES);
 
-            result.stream().map(f -> {
-                try {
-                    return (MeasurementAggregator) f.get();
-                } catch (Exception e) {
-                }
-                return null;
-            }).toList();
-
-
-            Collector<MeasurementAggregator, MeasurementAggregator, ResultRow> collector = Collector.of(
-                    MeasurementAggregator::new,
-                    CalculateAverage_mellester::measurementCombiner,
-
-                    CalculateAverage_mellester::measurementCombiner,
-                    agg -> {
-                        return new ResultRow(agg.min, agg.sum / agg.count, agg.max);
-                    },
-                    Collector.Characteristics.UNORDERED, Collector.Characteristics.CONCURRENT);
-
-            if (TerminatedWithinTime) {
-                System.out.println("Finished");
-            } else {
-                System.out.println("Not finished");
-            }
-        } catch (InterruptedException e) {
+            // if (System.getProperty("log.enable") == null)
+            System.out.println(treeMap);
+        }
+        catch (InterruptedException e) {
 
             e.printStackTrace();
             System.exit(1);
@@ -204,155 +180,159 @@ public class CalculateAverage_mellester {
 
     }
 
-    private static class Worker implements Callable<Object> {
+    private static class Worker implements Callable<Map<String, MeasurementAggregator>> {
 
         private final int id;
         private final Chunk chunk;
+        private final Map<ByteCharSequence, MeasurementAggregator> result = new HashMap<>();
 
         public Worker(int id, Chunk chunk) {
             this.id = id;
             this.chunk = chunk;
         }
 
-        private Integer old_index = 0;
-        private static final byte SEPERATOR = (byte) '\n';
+        void log(Object arg) {
+            if (System.getProperty("log.enable") != null) {
+                System.out.println("[" + id + "]" + arg);
+            }
+        }
+
+        private int old_index = 0;
+        private static final byte SEPERATOR1 = (byte) '\n';
+        private static final byte SEPERATOR2 = (byte) ';';
         private ByteBuffer buffer = null;
         private byte[] bytes = null;
 
-        private long lastOcurenceOfSeperator = -1;
-
-        private void findLastOcurenceOfSeperator() {
-            if (id == 0)
-                return;
-            IntStream.range(0, (int) OVERLAP_SIZE).filter(i -> bytes[(int) OVERLAP_SIZE - i] == SEPERATOR).findFirst()
-                    .ifPresentOrElse((i) -> {
-                        lastOcurenceOfSeperator = i;
-                    }, () -> {
-                        System.err.println("[" + id + "] No Seprator found in overlap");
-                        System.out.println(chunk.offset());
-                        System.out.println(new String(Worker.this.bytes));
-                        throw new RuntimeException("No Seprator found in overlap");
-                    });
-
-        }
-
         @Override
         public Map<String, MeasurementAggregator> call() {
-            System.out.println("[" + this.id + "]" + chunk);
-            final long offset = chunk.offset();
-            long lenght = MAPPING_SIZE + OVERLAP_SIZE;
             try {
-                lenght = Math.min(raf.length() - offset, lenght);
-                buffer = raf.getChannel().map(FileChannel.MapMode.READ_ONLY, offset, lenght);
-            } catch (IOException e) {
-                System.err.println("Error mapping file: " + offset + " " + lenght);
-                throw new UncheckedIOException(e);
+
+                buffer = chunk.buffer();
+                if (this.id != 0)
+                    skipToNextLine();
+                int remaining = buffer.remaining();
+                int buffer_size = (int) Math.min(remaining, OVERLAP_SIZE * 2);
+                this.bytes = new byte[buffer_size];
+                int offset = 0;
+                int bytesToRead = buffer_size;
+                while (bytesToRead > 0) {
+                    buffer.get(bytes, offset, bytesToRead);
+                    remaining -= bytesToRead;
+                    Arrays.fill(bytes, offset + bytesToRead, bytes.length, (byte) 0);
+                    int parsed = parse();
+                    System.arraycopy(bytes, parsed, bytes, 0, bytes.length - parsed);
+                    offset = bytes.length - parsed;
+                    bytesToRead = Math.min(buffer_size - offset, remaining);
+                    old_index = 0;
+
+                }
+                TreeMap<String, MeasurementAggregator> toRetrun = new TreeMap<>();
+                for (var entry : result.entrySet()) {
+                    var s = entry.getKey().toString();
+                    toRetrun.put(s.intern(), entry.getValue());
+                }
+                return toRetrun;
+
             }
-            this.bytes = new byte[buffer.remaining()];
-            buffer.get(bytes);
-            findLastOcurenceOfSeperator();
-
-            System.out.println("[" + this.id + "] lastOcurenceOfSeperator: " + lastOcurenceOfSeperator);
-            final List<ByteCharSequence> lines = new ArrayList<>(60);
-
-            System.out.println("[" + this.id + "] bytes: " + bytes.length);
-            IntStream.range((int) lastOcurenceOfSeperator + 1, (int) bytes.length)
-                    .filter(i -> bytes[i] == SEPERATOR).boxed()
-                    .map(i -> {
-                        var temp = new int[] { old_index, i - 1 };
-                        old_index = i + 1;
-                        return temp;
-                    }).toList().stream().parallel()
-                    .forEach((int[] pair) -> {
-                        lines.add(new ByteCharSequence(pair[0], pair[1]));
-                        // System.out.println("[" + this.id + "] index: " + pair[0] + " " + pair[1]);
-                        System.out.println("[" + this.id + "] line: " + pair[0] + " " + pair[1] + "\n"
-                                + new ByteCharSequence(pair[0], pair[1]));
-                    });
-
-            System.out.println("[" + this.id + "] lines: " + lines.size());
-            try {
-
-                Collector<Measurement, MeasurementAggregator, MeasurementAggregator> collector = Collector.of(
-                        MeasurementAggregator::new,
-                        CalculateAverage_mellester::measurementAccumulator,
-                        CalculateAverage_mellester::measurementCombiner,
-                        agg -> {
-                            return agg;
-                        },
-                        Collector.Characteristics.UNORDERED, Collector.Characteristics.CONCURRENT);
-
-                var b = lines.stream().parallel()
-                        .map(l -> new Measurement(l.split((byte) ';')))
-                        .collect(groupingBy(m -> m.station(), collector));
-                Map<ByteCharSequence, MeasurementAggregator> measurements = new TreeMap<ByteCharSequence, MeasurementAggregator>(
-                        b);
-
-                System.out.println("[" + this.id + "] measurements: " + measurements);
-                return measurements.entrySet().stream().collect(toMap(e -> e.getKey().toString(), e -> e.getValue()));
-            } catch (Exception e) {
+            catch (Exception e) {
                 // TODO: handle exception
-                System.err.println("Error in worker: " + this.id);
-                e.printStackTrace();
                 return null;
             }
+        }
+
+        private boolean skipToNextLine() {
+            while (buffer.hasRemaining()) {
+                byte b = buffer.get();
+                if (b == SEPERATOR1) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        private int parse() {
+            final int[] seperatorIndexs = IntStream.range(0, (int) bytes.length)
+                    .filter(i -> {
+                        byte b = bytes[i];
+                        return b == SEPERATOR1 || b == SEPERATOR2;
+                    }).toArray();
+            var pairs = IntStream.range(0, seperatorIndexs.length / 2)
+                    .mapToObj(
+                            i -> new SimpleEntry<Integer, Integer>(seperatorIndexs[i * 2], seperatorIndexs[i * 2 + 1]))
+                    .map(i -> {
+                        var station = new ByteCharSequence(Arrays.copyOfRange(bytes, old_index, i.getKey()));
+                        var value = new ByteCharSequence(Arrays.copyOfRange(bytes, i.getKey() + 1, i.getValue()));
+                        old_index = i.getValue() + 1;
+                        return new SimpleEntry<ByteCharSequence, Double>(station, parseDouble(value));
+                    }).toList();
+            int toReturn = old_index;
+
+            Collector<Measurement, MeasurementAggregator, MeasurementAggregator> collector = Collector.of(
+                    MeasurementAggregator::new,
+                    CalculateAverage_mellester::measurementAccumulator,
+                    CalculateAverage_mellester::measurementCombiner,
+                    agg -> {
+                        return agg;
+                    },
+                    Collector.Characteristics.UNORDERED, Collector.Characteristics.CONCURRENT);
+
+            var a = pairs.stream().parallel()
+                    .map(l -> new Measurement(l)).toList();
+            var b = a.stream().collect(groupingByConcurrent(m -> m.station(), collector));
+            b.forEach((
+                       station, measurementAggregator) -> result.merge(station, measurementAggregator,
+                               CalculateAverage_mellester::measurementCombiner));
+
+            return toReturn;
         }
 
         // Byte view into Worker.this.bytes
         private class ByteCharSequence implements CharSequence, Comparable<ByteCharSequence> {
 
-            private final int end;
-            private final int start;
+            private byte[] bytes = null;
 
-            public ByteCharSequence(int start, int end) {
-                this.start = start;
-                this.end = end;
+            public ByteCharSequence(byte[] bytes) {
+                this.bytes = bytes;
+                // assert (bytes.length >= 2);
             }
 
             @Override
             public int length() {
-                return this.end - this.start;
+                return this.bytes.length;
             }
 
             @Override
             public char charAt(int index) {
-                try {
-
-                    return (char) (Worker.this.bytes[start + index] & 0xff);
-                } catch (Exception e) {
-                    // TODO: handle exception
-                    System.err.println("Error in charAt: " + index);
-                    throw e;
-                }
+                return (char) this.bytes[index];
             }
 
             @Override
             public ByteCharSequence subSequence(int start, int end) {
-                return new ByteCharSequence(start + start, end - start);
-            }
-
-            public ByteCharSequence[] split(Byte sepreator) {
-                ByteCharSequence[] result = { this, null };
-                for (int i = 0; i < length(); i++) {
-                    if (charAt(i) == sepreator) {
-                        result[0] = subSequence(0, i);
-                        result[1] = subSequence(i + 1, end - i);
-                    }
-                }
-                if (result[1] == null) {
-                    System.err.println("No seperator found in line: " + this);
-                }
-                return result;
+                return new ByteCharSequence(Arrays.copyOfRange(this.bytes, start, end));
             }
 
             @Override
             public int compareTo(ByteCharSequence arg0) {
-                return Arrays.compare(Worker.this.bytes, this.start, this.end, Worker.this.bytes, arg0.start, arg0.end);
+                return Arrays.compare(this.bytes, arg0.bytes);
+            }
+
+            @Override
+            public boolean equals(Object obj) {
+                var otherBytes = ((ByteCharSequence) obj).bytes;
+                return Arrays.equals(this.bytes, otherBytes);
+            }
+
+            @Override
+            public int hashCode() {
+                // return Arrays.hashCode(this.bytes);
+                byte byte1 = this.bytes[0];
+                byte byte2 = this.bytes[this.bytes.length - 1];
+                return ((byte1 & 0xFF) << 8) | (byte2 & 0xFF);
             }
 
             @Override
             public String toString() {
-                return new String(Worker.this.bytes, this.start, this.end - this.start + 1);
+                return new String(this.bytes);
             }
 
         }
@@ -367,7 +347,6 @@ public class CalculateAverage_mellester {
         boolean isDecimal = false;
         for (int i = 0; i < chars.length(); i++) {
             char ch = chars.charAt(i);
-
             if (ch == '-') {
                 negateFactor = -1;
                 continue;
@@ -382,17 +361,20 @@ public class CalculateAverage_mellester {
             if (!isDecimal) {
                 if (left == 0) {
                     left = digit;
-                } else {
+                }
+                else {
                     left *= 10;
                     left += digit;
                 }
-            } else {
+            }
+            else {
                 numRight++;
                 if (numRight >= 9)
                     break;
                 if (right == 0) {
                     right = digit;
-                } else {
+                }
+                else {
                     right *= 10;
                     right += digit;
                 }
@@ -401,6 +383,8 @@ public class CalculateAverage_mellester {
 
         double decimal = left + right * Math.pow(10, -numRight);
         decimal *= negateFactor;
+
         return decimal;
     }
+
 }

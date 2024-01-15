@@ -16,5 +16,5 @@
 #
 
 
-JAVA_OPTS="--enable-preview -Xms2g -Xmx2g --add-modules=jdk.incubator.vector"
+JAVA_OPTS=" --enable-preview -Xms3g -Xmx3g --add-modules=jdk.incubator.vector -XX:+UnlockExperimentalVMOptions -XX:+UseParallelGC -XX:CompilationMode=high-only"
 time java $JAVA_OPTS --class-path target/average-1.0.0-SNAPSHOT.jar dev.morling.onebrc.CalculateAverage_mellester
